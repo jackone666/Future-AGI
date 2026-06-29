@@ -1,0 +1,1820 @@
+/* eslint-disable react/prop-types */
+import {
+  Autocomplete,
+  Box,
+  Chip,
+  CircularProgress,
+  IconButton,
+  InputAdornment,
+  Tab,
+  Tabs,
+  TextField,
+  Tooltip,
+  Typography,
+} from "@mui/material";
+import { alpha } from "@mui/material/styles";
+import PropTypes from "prop-types";
+import React, {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useQuery } from "@tanstack/react-query";
+import DraggableColResizer from "src/components/draggable-col-resizer";
+import Iconify from "src/components/iconify";
+import axios, { endpoints } from "src/utils/axios";
+import { PROJECT_SOURCE } from "src/utils/constants";
+import {
+  canonicalEntries,
+  canonicalKeys,
+  stripAttributePathPrefix,
+} from "src/utils/utils";
+
+import {
+  InlineAudio,
+  RecordingGroup,
+} from "src/components/inline-audio/inline-row-audio";
+import {
+  collectRecordingTracks,
+  isAudioKey,
+  isAudioUrlString,
+  isRecordingObjectKey,
+} from "src/components/inline-audio/audio-detection";
+import { useForm, useWatch } from "react-hook-form";
+import CustomTooltip from "src/components/tooltip";
+import TaskFilterBar from "src/sections/tasks/components/TaskFilterBar";
+import { buildApiFilterArray } from "src/sections/tasks/components/TaskLivePreview";
+import { JsonValueTree } from "./DatasetTestMode";
+import EvalResultDisplay from "./EvalResultDisplay";
+import SpanRowList from "./SpanRowList";
+import useErrorLocalizerPoll from "../hooks/useErrorLocalizerPoll";
+import {
+  buildFlatValueMap,
+  executeEvalForRow,
+} from "../utils/evalExecution";
+
+
+const ROW_TYPE_OPTIONS = [
+  { value: "Span", label: "Spans", icon: "solar:layers-outline" },
+  { value: "Trace", label: "Traces", icon: "solar:flow-outline" },
+  { value: "Session", label: "Sessions", icon: "solar:chat-line-outline" },
+];
+
+// Hover-tooltip content for the Columns / Value table. Stringifies
+// primitives and JSON-encodes objects, then caps length so a 50k-char
+// transcript doesn't blow up the tooltip.
+const TOOLTIP_MAX = 4000;
+function formatTooltipValue(val) {
+  if (val === null || val === undefined) return "—";
+  let text;
+  if (typeof val === "string") text = val;
+  else if (typeof val === "boolean" || typeof val === "number")
+    text = String(val);
+  else {
+    try {
+      text = JSON.stringify(val, null, 2);
+    } catch {
+      text = String(val);
+    }
+  }
+  return text.length > TOOLTIP_MAX
+    ? `${text.slice(0, TOOLTIP_MAX)}… (${text.length - TOOLTIP_MAX} more chars)`
+    : text;
+}
+
+// Deep search: check if a value (including nested JSON keys/values) matches query
+function deepMatch(val, q) {
+  if (val === null || val === undefined) return false;
+  if (typeof val === "string") return val.toLowerCase().includes(q);
+  if (typeof val === "number" || typeof val === "boolean")
+    return String(val).toLowerCase().includes(q);
+  if (Array.isArray(val)) return val.some((v) => deepMatch(v, q));
+  if (typeof val === "object") {
+    return Object.entries(val).some(
+      ([k, v]) => k.toLowerCase().includes(q) || deepMatch(v, q),
+    );
+  }
+  return false;
+}
+
+// Sort entries so span_attributes, input, output, metadata come first
+const PRIORITY_KEYS = ["span_attributes", "input", "output", "metadata"];
+function sortEntries(entries) {
+  return [...entries].sort(([a], [b]) => {
+    const ai = PRIORITY_KEYS.indexOf(a);
+    const bi = PRIORITY_KEYS.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1;
+    if (bi !== -1) return 1;
+    return 0;
+  });
+}
+
+// Recursively find a span by ID in the observation spans tree.
+function findSpanInTree(spans, spanId) {
+  if (!spans) return null;
+  for (const item of spans) {
+    const span = item.observation_span;
+    if (span?.id === spanId) return span;
+    if (item.children?.length) {
+      const found = findSpanInTree(item.children, spanId);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+// Flatten span tree into an ordered list (depth-first, like the graph)
+// Flatten span tree into an ordered list with smart indexing.
+// Each span gets: _depth, _index (global), _path (breadcrumb), _nameIndex (occurrence # for duplicate names)
+function flattenSpanTree(
+  spans,
+  depth = 0,
+  parentPath = "",
+  nameCountMap = null,
+) {
+  if (!spans) return [];
+  const isRoot = nameCountMap === null;
+  if (isRoot) nameCountMap = {};
+  const result = [];
+
+  for (const item of spans) {
+    const obsSpan = item.observation_span;
+    if (obsSpan) {
+      const s = obsSpan;
+      const name = s.name || "span";
+
+      // Track per-name occurrence count
+      nameCountMap[name] = (nameCountMap[name] || 0) + 1;
+      const nameIndex = nameCountMap[name];
+
+      // Build breadcrumb path
+      const path = parentPath ? `${parentPath} › ${name}` : name;
+
+      result.push({
+        ...s,
+        _depth: depth,
+        _path: path,
+        _nameIndex: nameIndex,
+        _nameTotal: 0, // filled in second pass
+      });
+
+      if (item.children?.length) {
+        result.push(
+          ...flattenSpanTree(item.children, depth + 1, path, nameCountMap),
+        );
+      }
+    }
+  }
+
+  // Second pass (root only): fill in _nameTotal so we know if # suffix is needed
+  if (isRoot) {
+    for (const span of result) {
+      span._nameTotal = nameCountMap[span.name || "span"] || 1;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Tracing test mode for evals.
+ *
+ * 1. Pick a project
+ * 2. Choose row type: Span / Trace / Session
+ * 3. Browse paginated data with expandable JSON values
+ * 4. Map template variables to data fields
+ * 5. Run eval test
+ */
+// Normalize external row-type values (lowercase from task form) to the
+// internal capitalized form this component uses. Voice is first-class
+// so the dedicated voice_call_detail endpoint is used.
+const normalizeRowType = (value) => {
+  if (!value) return "Span";
+  const v = String(value).toLowerCase();
+  if (v === "span" || v === "spans") return "Span";
+  if (v === "trace" || v === "traces") return "Trace";
+  if (v === "session" || v === "sessions") return "Session";
+  if (
+    v === "voicecall" ||
+    v === "voicecalls" ||
+    v === "voice_calls" ||
+    v === "voice"
+  ) {
+    return "VoiceCall";
+  }
+  return "Span";
+};
+
+const TracingTestMode = React.forwardRef(
+  (
+    {
+      templateId,
+      model = "turing_large",
+      variables = [],
+      codeParams = {},
+      onTestResult,
+      onColumnsLoaded,
+      onClearResult,
+      // Signals to EvalPickerConfigFull that all variables are mapped so
+      // it can enable the Test Evaluation / Add Evaluation buttons.
+      onReadyChange,
+      // When true, runtime context comes from data injection — no sample row needed.
+      hasDataInjection = false,
+      // Optional: pre-select project + row type and hide the project picker
+      // and the row type toggle. Used by the task flow's Add Evaluation
+      // drawer so the user sees the exact same data their task will run on.
+      initialProjectId = null,
+      initialRowType = null,
+      // Optional: seed the variable→field mapping (used when editing an
+      // already-configured eval so the user's previous mapping is preserved).
+      initialMapping = null,
+      errorLocalizerEnabled = false,
+      isComposite = false,
+      compositeAdhocConfig = null,
+      // Optional ad-hoc filters merged into the row-list `filters` param.
+      localFilters = [],
+      // When true, TracingTestMode owns the filter state internally and
+      // renders a TaskFilterBar above the columns/values table. Used by
+      // TestPlayground (eval detail) where there's no parent form to
+      // wire filters from.
+      hostsFilter = false,
+      // Optional: precomputed mapping-path list from the parent picker
+      // (e.g. TaskConfigPanel sends sessions / traces paths fetched from
+      // get_eval_attributes_list). When provided AND rowType is Session
+      // or Trace, the variable-mapping dropdown reads from this list
+      // instead of walking the loaded row's data — so users see all
+      // candidate paths immediately, regardless of drill-in depth.
+      // When null/empty, falls back to today's walked-detail behaviour.
+      pickerSourceColumns = null,
+      // When true, the mapping Autocomplete accepts arbitrary typed values
+      // (freeSolo) instead of being locked to `fieldNames`. The BE resolver
+      // (_walk_dotted_path) already handles arbitrary depths safely across
+      // spans, traces, and sessions. Currently set by EvalPickerConfigFull
+      // only for source="task" — other surfaces stay locked until each
+      // one's resolver is audited.
+      allowCustomFieldPath = false,
+    },
+    ref,
+  ) => {
+    const projectLocked = !!initialProjectId;
+    const rowTypeLocked = !!initialRowType;
+
+    // Project
+    const [projects, setProjects] = useState([]);
+    const [loadingProjects, setLoadingProjects] = useState(false);
+    const [selectedProjectId, setSelectedProjectId] = useState(
+      initialProjectId || "",
+    );
+
+    // Row type
+    const [rowType, setRowType] = useState(
+      initialRowType ? normalizeRowType(initialRowType) : "Span",
+    );
+
+    const internalFilterForm = useForm({ defaultValues: { filters: [] } });
+    const internalFormFilters = useWatch({
+      control: internalFilterForm.control,
+      name: "filters",
+    });
+    const internalApiFilters = useMemo(
+      () => buildApiFilterArray(internalFormFilters),
+      [internalFormFilters],
+    );
+    const effectiveFilters = hostsFilter ? internalApiFilters : localFilters;
+
+    // Filter rows are project-scoped (attribute columns differ per project);
+    // clear them when the user switches projects so stale columns aren't sent.
+    useEffect(() => {
+      if (hostsFilter) internalFilterForm.reset({ filters: [] });
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedProjectId]);
+
+    // Project details fetched per selected project. The list_projects API
+    // omits the `source` field, so we hit project-detail to know whether
+    // the selected project is a voice/simulator project. Task flow relies
+    // on the same detail fetch when the project is pre-selected.
+    const [selectedProjectDetail, setSelectedProjectDetail] = useState(null);
+
+    // Selected project object — prefer the detail fetch (has `source`) and
+    // fall back to the list row so callers still get `name` etc. while the
+    // detail request is in flight.
+    const selectedProject = useMemo(() => {
+      if (selectedProjectDetail) return selectedProjectDetail;
+      if (projectLocked) return null;
+      return (
+        projects.find((p) => String(p.id) === String(selectedProjectId)) || null
+      );
+    }, [selectedProjectDetail, projectLocked, projects, selectedProjectId]);
+
+    const isVoiceProject = selectedProject?.source === PROJECT_SOURCE.SIMULATOR;
+
+    // Auto-switch rowType when the project type changes: voice projects
+    // are always VoiceCall; switching back to a non-voice project falls
+    // back to Span so the data table can populate with span rows.
+    useEffect(() => {
+      if (rowTypeLocked) return;
+      if (!selectedProjectId) return;
+      if (isVoiceProject && rowType !== "VoiceCall") {
+        setRowType("VoiceCall");
+      } else if (!isVoiceProject && rowType === "VoiceCall") {
+        setRowType("Span");
+      }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedProjectId, isVoiceProject]);
+
+    // Data
+    const [columns, setColumns] = useState([]);
+    const [rows, setRows] = useState([]);
+    const [totalRows, setTotalRows] = useState(0);
+    const [currentRowIndex, setCurrentRowIndex] = useState(0);
+    const [loading, setLoading] = useState(false);
+    // Key the last-completed fetch so we can derive "is the current
+    // selection stale w.r.t. the last fetch" at render time. React
+    // effects run *after* paint, so tracking a `hasFetched` boolean
+    // still left a render-frame gap where the empty state flashed and
+    // the spinner appeared late. Comparing `selectedProjectId:rowType`
+    // against the last-fetched key tells us synchronously — in the same
+    // render that the props changed — that new data is on the way.
+    const [lastFetchedKey, setLastFetchedKey] = useState(null);
+    const currentFetchKey = selectedProjectId
+      ? `${selectedProjectId}:${rowType}`
+      : null;
+    const isPendingNewFetch =
+      !!currentFetchKey && lastFetchedKey !== currentFetchKey;
+
+    // Columns/Value table — user-resizable key column. Drag the divider
+    // between key and value to widen long dotted paths. Ref holds the
+    // live width during drag so the mousemove handler reads the
+    // current value without recreating handlers.
+    const [keyColWidth, setKeyColWidth] = useState(130);
+    const keyColWidthRef = useRef(130);
+    useEffect(() => {
+      keyColWidthRef.current = keyColWidth;
+    }, [keyColWidth]);
+
+    // Span/trace detail (full attributes)
+    const [spanDetail, setSpanDetail] = useState(null);
+    const [loadingDetail, setLoadingDetail] = useState(false);
+
+    // Per-row cache so toggling rows doesn't refetch the trace or re-walk
+    // the response. Keyed by `${rowType}:${traceId}[:${spanId}]`. Each entry
+    // is `{ detail, fieldNames? }` — fieldNames is filled lazily on first
+    // walk and reused on subsequent row toggles.
+    const detailCacheRef = useRef(new Map());
+
+    // Table display
+    const [tableSearch, setTableSearch] = useState("");
+    const [expandedCols, setExpandedCols] = useState({});
+
+    // Variable mapping
+    const [mapping, setMapping] = useState(() =>
+      initialMapping && typeof initialMapping === "object"
+        ? { ...initialMapping }
+        : {},
+    );
+
+    // Template ID ref (updated via imperative handle for first-test flow)
+    const templateIdRef = useRef(templateId);
+    useEffect(() => {
+      templateIdRef.current = templateId;
+    }, [templateId]);
+
+    // Eval result
+    const [isRunning, setIsRunning] = useState(false);
+    const [result, setResult] = useState(null);
+    const [error, setError] = useState(null);
+    // Async error localization poll — see DatasetTestMode for rationale.
+    const { state: errorLocalizerState, start: startErrorLocalizerPoll } =
+      useErrorLocalizerPoll();
+
+    // ── Fetch project list (skip when project is pre-selected/locked) ──
+    useEffect(() => {
+      if (projectLocked) return;
+      const fetchProjects = async () => {
+        setLoadingProjects(true);
+        try {
+          const { data } = await axios.get(endpoints.project.listProjects(), {
+            params: { project_type: "observe" },
+          });
+          const items = data?.result?.projects || data?.result || [];
+          setProjects(Array.isArray(items) ? items : []);
+        } catch {
+          setProjects([]);
+        } finally {
+          setLoadingProjects(false);
+        }
+      };
+      fetchProjects();
+    }, [projectLocked]);
+
+    // Fetch project detail whenever the selection changes. The list_projects
+    // API doesn't include `source`, so without this the user-picked path
+    // would never detect voice projects. Also covers the task-flow path
+    // where the list fetch is skipped entirely.
+    useEffect(() => {
+      const pid = projectLocked ? initialProjectId : selectedProjectId;
+      if (!pid) {
+        setSelectedProjectDetail(null);
+        return undefined;
+      }
+      let cancelled = false;
+      (async () => {
+        try {
+          const { data } = await axios.get(
+            endpoints.project.getProjectById(pid),
+          );
+          if (cancelled) return;
+          const detail = data?.result || data || null;
+          setSelectedProjectDetail(detail);
+        } catch {
+          if (!cancelled) setSelectedProjectDetail(null);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [projectLocked, initialProjectId, selectedProjectId]);
+
+    // ── Fetch data when project or rowType changes ──
+    useEffect(() => {
+      if (!selectedProjectId) {
+        setColumns([]);
+        setRows([]);
+        setTotalRows(0);
+        setCurrentRowIndex(0);
+        setLastFetchedKey(null);
+        return;
+      }
+
+      setLoading(true);
+      let cancelled = false;
+      const fetchKey = `${selectedProjectId}:${rowType}`;
+
+      const fetchData = async () => {
+        setRows([]);
+        try {
+          if (rowType === "VoiceCall") {
+            const { data } = await axios.get(endpoints.project.getCallLogs, {
+              params: {
+                project_id: selectedProjectId,
+                page: 1,
+                page_size: 50,
+                filters: JSON.stringify(effectiveFilters || []),
+              },
+            });
+            if (cancelled) return;
+            const result = data?.result || data || {};
+            const rowsOut = result.results || result.data || result.calls || [];
+            setColumns([]);
+            setRows(rowsOut);
+            setTotalRows(result.total_count || result.total || rowsOut.length);
+            setCurrentRowIndex(0);
+            return;
+          }
+
+          let endpoint;
+          const params = {
+            project_id: selectedProjectId,
+            page_number: 0,
+            page_size: 50,
+            filters: JSON.stringify(effectiveFilters || []),
+            interval: "year",
+          };
+
+          if (rowType === "Span") {
+            endpoint = endpoints.project.getSpansForObserveProject();
+          } else if (rowType === "Trace") {
+            endpoint = endpoints.project.getTracesForObserveProject();
+          } else {
+            endpoint = endpoints.project.projectSessionList();
+          }
+
+          const { data } = await axios.get(endpoint, { params });
+          if (cancelled) return;
+          const res = data?.result || {};
+
+          const cols = res.config || [];
+          const tableRows = res.table || [];
+          const total = res.metadata?.total_rows || tableRows.length;
+
+          setColumns(cols);
+          setRows(tableRows);
+          setTotalRows(total);
+          setCurrentRowIndex(0);
+        } catch {
+          if (cancelled) return;
+          setColumns([]);
+          setRows([]);
+          setTotalRows(0);
+        } finally {
+          if (!cancelled) {
+            setLoading(false);
+            setLastFetchedKey(fetchKey);
+          }
+        }
+      };
+
+      fetchData();
+      return () => {
+        cancelled = true;
+      };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedProjectId, rowType, JSON.stringify(effectiveFilters || [])]);
+
+    // ── Current row ──
+    const currentRow = rows[currentRowIndex] || null;
+
+    // ── Session drill-down queries (rowType=Session only) ──
+    // The mapping dropdown is sourced from `pickerSourceColumns` (the
+    // precomputed paths from get_eval_attributes_list) when present, so
+    // these queries primarily power the preview pane: showing real
+    // values from the session's first trace + spans so users can sanity-
+    // check what their mapping resolves to. Two queries: session detail
+    // (paginated traces) and the first trace's spans (eager-fetched on
+    // session select). React Query handles caching and dedup; cache keys
+    // are namespaced under `picker-` to stay isolated from any sibling
+    // hook in the wider app.
+    const sessionRowSessionId =
+      rowType === "Session" ? currentRow?.session_id : null;
+
+    const sessionDetailQuery = useQuery({
+      queryKey: ["picker-session-detail", sessionRowSessionId],
+      queryFn: async () => {
+        const resp = await axios.get(
+          `${endpoints.project.traceSession}${sessionRowSessionId}/`,
+          { params: { page_number: 0, page_size: 30 } },
+        );
+        return resp.data?.result || {};
+      },
+      enabled: !!sessionRowSessionId,
+      staleTime: 30_000,
+    });
+
+    const sessionFirstTraceId =
+      sessionDetailQuery.data?.response?.[0]?.trace_id || null;
+
+    const sessionFirstTraceSpansQuery = useQuery({
+      queryKey: ["picker-trace-spans", sessionFirstTraceId],
+      queryFn: async () => {
+        const resp = await axios.get(
+          endpoints.project.getTrace(sessionFirstTraceId),
+        );
+        const r = resp.data?.result || {};
+        return {
+          trace: r.trace,
+          spans: flattenSpanTree(r.observation_spans || []),
+        };
+      },
+      enabled: !!sessionFirstTraceId,
+      staleTime: 30_000,
+    });
+
+    // ── Fetch full span/trace detail when row changes ──
+    useEffect(() => {
+      if (!currentRow) {
+        setSpanDetail(null);
+        return;
+      }
+
+      const spanId = currentRow.span_id;
+      const traceId = currentRow.trace_id;
+      const cacheKey =
+        rowType === "Span"
+          ? `Span:${traceId || ""}:${spanId || ""}`
+          : `${rowType}:${traceId || spanId || ""}`;
+
+      // Cache hit: reuse the exact same detailData reference so the
+      // downstream fieldNames memo short-circuits too.
+      const cached = detailCacheRef.current.get(cacheKey);
+      if (cached) {
+        setSpanDetail(cached.detail);
+        setLoadingDetail(false);
+        return;
+      }
+
+      const fetchDetail = async () => {
+        setLoadingDetail(true);
+        try {
+          let detailData = null;
+
+          // Voice → dedicated voice_call_detail endpoint (transcript,
+          // recording URLs, scenario info, customer info, latency, etc.)
+          if (rowType === "VoiceCall" && traceId) {
+            try {
+              const { data } = await axios.get(
+                endpoints.project.getVoiceCallDetail,
+                { params: { trace_id: traceId } },
+              );
+              const voiceResult = data?.result || data?.data || data || {};
+              // Spread row-list fields first as a fallback so we never
+              // lose data that was only present on the list row.
+              detailData = { ...currentRow, ...voiceResult };
+            } catch {
+              detailData = { ...currentRow };
+            }
+          } else if ((rowType === "Span" || rowType === "Trace") && traceId) {
+            // Fetch the TRACE detail — same API as the drawer uses.
+            // This returns all observation spans with full attributes (including spanAttributes).
+            const { data } = await axios.get(
+              endpoints.project.getTrace(traceId),
+            );
+            const traceResult = data?.result;
+
+            const spans = traceResult?.observation_spans;
+            if (rowType === "Span" && spanId && spans) {
+              detailData = findSpanInTree(spans, spanId);
+              if (!detailData) {
+                const firstSpan = spans?.[0];
+                detailData = firstSpan?.observation_span || traceResult?.trace;
+              }
+            } else {
+              const traceInfo = traceResult?.trace || {};
+              const allSpans = flattenSpanTree(spans);
+              detailData = {
+                ...traceInfo,
+                spans: allSpans,
+              };
+            }
+          } else if (rowType === "Session") {
+            // Sessions are assembled via React Query at the top of the
+            // component (sessionDetailQuery + sessionFirstTraceSpansQuery)
+            // so the picker can show real session metadata + traces +
+            // first-trace spans in the preview pane. The actual
+            // assembly/setSpanDetail happens in the watcher effect
+            // below — return early here so we don't clobber it with
+            // stale row-only data.
+            setLoadingDetail(false);
+            return;
+          } else {
+            detailData = { ...currentRow };
+          }
+
+          detailCacheRef.current.set(cacheKey, { detail: detailData });
+          setSpanDetail(detailData);
+        } catch {
+          setSpanDetail(null);
+        } finally {
+          setLoadingDetail(false);
+        }
+      };
+
+      fetchDetail();
+    }, [currentRow, currentRowIndex, rowType, columns]);
+
+    // ── Session detail watcher ──
+    // Compose `spanDetail` from the React Query results when in Session
+    // mode. Watches both queries' data so the preview updates as soon as
+    // the session detail lands and again when the first-trace spans
+    // arrive. Pure assembly — no fetching here, just shaping the object
+    // the walker / preview consume.
+    useEffect(() => {
+      if (rowType !== "Session") return;
+      if (!sessionRowSessionId) {
+        setSpanDetail(null);
+        return;
+      }
+      const sessionMeta = sessionDetailQuery.data?.session_metadata;
+      const traces = sessionDetailQuery.data?.response || [];
+      if (!sessionMeta && traces.length === 0) {
+        setLoadingDetail(sessionDetailQuery.isLoading);
+        return;
+      }
+      const firstTraceSpans = sessionFirstTraceSpansQuery.data?.spans || [];
+      const detailData = {
+        ...(sessionMeta || {}),
+        traces: traces.map((t, i) => ({
+          ...t,
+          // First trace gets eager-fetched spans for immediate preview;
+          // remaining traces start empty and would be filled when the
+          // user clicks them (lazy fetch hook to be added in a follow-
+          // up if the basic preview proves not enough).
+          spans: i === 0 ? firstTraceSpans : [],
+        })),
+      };
+      setSpanDetail(detailData);
+      setLoadingDetail(
+        sessionDetailQuery.isLoading || sessionFirstTraceSpansQuery.isLoading,
+      );
+    }, [
+      rowType,
+      sessionRowSessionId,
+      sessionDetailQuery.data,
+      sessionDetailQuery.isLoading,
+      sessionFirstTraceSpansQuery.data,
+      sessionFirstTraceSpansQuery.isLoading,
+    ]);
+
+    // ── Extract displayable fields from current row ──
+    const rowFields = useMemo(() => {
+      if (!currentRow) return [];
+      if (!columns.length) {
+        // No column config — use all row keys directly. canonicalEntries
+        // drops the camelCase aliases the axios interceptor attaches so
+        // each backend field only appears once.
+        return canonicalEntries(currentRow).map(([key, val]) => ({
+          key,
+          colId: key,
+          value: val ?? "",
+          raw: val,
+        }));
+      }
+      return columns
+        .filter((col) => {
+          const name = col.name || col.headerName;
+          return col.id && name && !["id", "org_id"].includes(col.id);
+        })
+        .map((col) => {
+          const value = currentRow[col.id] ?? "";
+          return {
+            key: col.name || col.headerName || col.id,
+            colId: col.id,
+            value: value != null ? value : "",
+            raw: value,
+          };
+        });
+    }, [currentRow, columns]);
+
+    // ── Attribute names for variable mapping dropdown ──
+    // Expand nested object keys into dot-notation paths (e.g. input.role,
+    // metadata.name). Soft-flatten: attributes inside `span_attributes.*`
+    // are surfaced as bare names (e.g. `input` instead of
+    // `span_attributes.input`) so users can map variables to short,
+    // short field names. Top-level fields with the same name
+    // win the deduplication. The resolver below transparently falls back
+    // to `span_attributes.<name>` when the top-level lookup misses, so
+    // legacy mappings that already stored the full `span_attributes.`
+    // prefix continue to work unchanged.
+    // Walk the detail payload into dot-notation paths. Split from
+    // `fieldNames` below so the expensive recursion only re-runs when the
+    // `spanDetail` reference actually changes — navigating rows that share
+    // a cache entry returns the same `spanDetail` and skips the walk. Per-
+    // trace walked output is also memoised back into `detailCacheRef` so a
+    // cross-row bounce gets the same list without re-walking.
+    const walkedFromDetail = useMemo(() => {
+      const source = spanDetail || null;
+      if (!source) return null;
+
+      // Reuse previously walked output for this detail reference if we
+      // have it — avoids rewalking when React reuses the same cached
+      // detailData object across row toggles.
+      for (const entry of detailCacheRef.current.values()) {
+        if (entry.detail === source && entry.fieldNames) {
+          return entry.fieldNames;
+        }
+      }
+
+      const keys = [];
+      // Walks both dicts and arrays. Array elements get numeric
+      // indices (e.g. `messages.0.content`) so users can target
+      // individual items in chat-message lists. Limits prevent
+      // runaway recursion: 5000 dict keys, 500 array elements.
+      const ARRAY_PEEK = 500;
+      const DICT_LIMIT = 5000;
+      // Subtrees we deliberately don't recurse into — the key itself
+      // stays selectable, but its (often multi-MB) children are skipped
+      // so the first-row walk finishes in tens of ms on voice traces.
+      // `raw_log` is the Vapi call dump, `metrics_data` / `call_logs`
+      // are the per-turn payloads, `provider_transcript` is the raw
+      // transcript string — none of these are useful as variable paths.
+      const NO_RECURSE_KEYS = new Set([
+        "raw_log",
+        "rawLog",
+        "metrics_data",
+        "metricsData",
+        "call_logs",
+        "callLogs",
+        "provider_transcript",
+        "providerTranscript",
+      ]);
+      const walk = (node, prefix) => {
+        if (Array.isArray(node)) {
+          node.slice(0, ARRAY_PEEK).forEach((item, idx) => {
+            const path = prefix ? `${prefix}.${idx}` : String(idx);
+            keys.push(path);
+            if (item && typeof item === "object") {
+              walk(item, path);
+            }
+          });
+          return;
+        }
+        // canonicalEntries strips the camelCase aliases the axios
+        // interceptor layers on top of snake_case fields, otherwise the
+        // attribute autocomplete dropdown lists every path twice.
+        for (const [k, v] of canonicalEntries(node)) {
+          if (k.startsWith("_")) continue;
+          const path = prefix ? `${prefix}.${k}` : k;
+          keys.push(path);
+          if (NO_RECURSE_KEYS.has(k)) continue;
+          if (v && typeof v === "object") {
+            if (Array.isArray(v) || canonicalKeys(v).length < DICT_LIMIT) {
+              walk(v, path);
+            }
+          }
+        }
+      };
+      walk(source, "");
+      // Strip wrapper/span_attributes prefix and dedupe against top-level keys.
+      const seen = new Set();
+      const flattened = [];
+      keys.forEach((k) => {
+        const short = stripAttributePathPrefix(k);
+        if (seen.has(short)) return;
+        seen.add(short);
+        flattened.push(short);
+      });
+
+      // Persist back into the per-row cache so the next row toggle that
+      // resolves to this same detail reference short-circuits the walk.
+      for (const [key, entry] of detailCacheRef.current.entries()) {
+        if (entry.detail === source) {
+          detailCacheRef.current.set(key, { ...entry, fieldNames: flattened });
+          break;
+        }
+      }
+
+      return flattened;
+    }, [spanDetail]);
+
+    // Mapping-dropdown source. For Session / Trace row types when the
+    // parent picker passed in a precomputed list (TaskConfigPanel does
+    // this with the get_eval_attributes_list result), use it directly so
+    // users see every candidate path the moment they pick the row-type
+    // tab — no drill-in required. Span row type and any caller that
+    // doesn't pass pickerSourceColumns falls back to walking the loaded
+    // detail (existing behaviour).
+    const fieldNames = useMemo(() => {
+      const usePrecomputed =
+        Array.isArray(pickerSourceColumns) &&
+        pickerSourceColumns.length > 0 &&
+        (rowType === "Session" || rowType === "Trace");
+      if (usePrecomputed) {
+        return pickerSourceColumns
+          .map((c) =>
+            typeof c === "string" ? c : c?.field || c?.name || c?.headerName,
+          )
+          .filter(Boolean);
+      }
+      return walkedFromDetail || rowFields.map((f) => f?.colId || f?.key);
+    }, [pickerSourceColumns, rowType, walkedFromDetail, rowFields]);
+
+    // Notify parent of available fields for autocomplete
+    useEffect(() => {
+      if (fieldNames.length > 0 && onColumnsLoaded) {
+        const cols = fieldNames.map((k) => ({
+          id: k,
+          name: k,
+          dataType: "text",
+        }));
+        onColumnsLoaded(cols, {});
+      }
+    }, [fieldNames.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // Auto-map variables to fields when names match
+    useEffect(() => {
+      if (!fieldNames.length || !variables.length) return;
+      const fieldSet = new Set(fieldNames);
+      setMapping((prev) => {
+        const next = { ...prev };
+        let changed = false;
+        variables.forEach((v) => {
+          // Normalize legacy `span_attributes.X` values to the soft-flattened
+          // form when X now exists in the dropdown — otherwise the Select
+          // renders blank because the stored value has no matching MenuItem.
+          const existing = next[v];
+          if (
+            typeof existing === "string" &&
+            existing.startsWith("span_attributes.")
+          ) {
+            const stripped = existing.slice("span_attributes.".length);
+            if (fieldSet.has(stripped)) {
+              next[v] = stripped;
+              changed = true;
+              return;
+            }
+          }
+          if (next[v]) return;
+          const exact = fieldNames.find((f) => f === v);
+          const ci =
+            !exact &&
+            fieldNames.find((f) => f.toLowerCase() === v.toLowerCase());
+          const match = exact || ci;
+          if (match) {
+            next[v] = match;
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }, [variables, fieldNames]);
+
+    // Mapping is always required; a sample row only when not using data injection.
+    useEffect(() => {
+      if (!onReadyChange) return;
+      const allMapped =
+        variables.length === 0 ||
+        variables.every((v) => mapping[v] && String(mapping[v]).length > 0);
+      const hasRow = !!currentRow;
+      const ready = hasDataInjection ? allMapped : allMapped && hasRow;
+      onReadyChange(ready, mapping);
+    }, [variables, mapping, currentRow, hasDataInjection, onReadyChange]);
+
+    // ── Run test ──
+    const handleRunTest = useCallback(async () => {
+      const tid = templateIdRef.current;
+      if (!tid) {
+        onTestResult?.(false, "No template ID — save the eval first");
+        return;
+      }
+      setIsRunning(true);
+      setResult(null);
+      setError(null);
+
+      if (!variables.length) {
+        onTestResult?.(
+          false,
+          "No variables to map — eval template may still be loading",
+        );
+        setIsRunning(false);
+        return;
+      }
+      if (!spanDetail) {
+        onTestResult?.(
+          false,
+          "Span data not loaded yet — please wait and retry",
+        );
+        setIsRunning(false);
+        return;
+      }
+
+      const flatValueMap = buildFlatValueMap(spanDetail);
+      const evalItem = {
+        template_id: tid,
+        template_type: isComposite ? "composite" : undefined,
+        model,
+      };
+      const result = await executeEvalForRow({
+        evalItem,
+        rowType,
+        currentRow,
+        spanDetail,
+        mapping,
+        flatValueMap,
+        rowFields,
+        codeParams,
+        errorLocalizerEnabled,
+        compositeAdhocConfig,
+      });
+
+      if (result.ok) {
+        // EvalResultDisplay reads `compositeResult` for composite, or the
+        // legacy `output`/`reason`/`score` keys for single.
+        const nextResult = result.isComposite
+          ? {
+              output: result.output,
+              reason: result.reason,
+              compositeResult: result.compositeResult,
+            }
+          : result.raw;
+        setResult(nextResult);
+        onTestResult?.(true, nextResult);
+        if (!result.isComposite && errorLocalizerEnabled && result.logId) {
+          startErrorLocalizerPoll(result.logId);
+        }
+      } else {
+        setError(result.errorMessage);
+        onTestResult?.(false, result.errorMessage);
+      }
+      setIsRunning(false);
+    }, [
+      templateId,
+      variables,
+      mapping,
+      spanDetail,
+      rowFields,
+      currentRow,
+      rowType,
+      onTestResult,
+      errorLocalizerEnabled,
+      isComposite,
+      compositeAdhocConfig,
+      startErrorLocalizerPoll,
+      codeParams,
+      model,
+    ]);
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        runTest: (overrideTemplateId) => {
+          if (overrideTemplateId) templateIdRef.current = overrideTemplateId;
+          handleRunTest();
+        },
+      }),
+      [handleRunTest],
+    );
+
+    return (
+      <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
+        {/* Project selector — hidden when pre-selected (e.g. task flow) */}
+        {!projectLocked && (
+          <Box>
+            <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+              Project
+              <Typography component="span" sx={{ color: "error.main" }}>
+                *
+              </Typography>
+            </Typography>
+            <Autocomplete
+              size="small"
+              options={projects}
+              getOptionLabel={(opt) => opt?.name || opt?.id || ""}
+              value={projects.find((p) => p.id === selectedProjectId) || null}
+              onChange={(_, val) => {
+                setSelectedProjectId(val?.id || "");
+                setMapping({});
+                setColumns([]);
+              }}
+              loading={loadingProjects}
+              openOnFocus
+              renderInput={(params) => (
+                <TextField
+                  {...params}
+                  placeholder="Search projects..."
+                  InputProps={{
+                    ...params.InputProps,
+                    sx: { ...params.InputProps.sx, fontSize: "13px" },
+                    endAdornment: loadingProjects ? (
+                      <InputAdornment position="end">
+                        <CircularProgress size={14} />
+                      </InputAdornment>
+                    ) : (
+                      params.InputProps.endAdornment
+                    ),
+                  }}
+                />
+              )}
+              renderOption={(props, option) => {
+                const { key, ...rest } = props;
+                return (
+                  <Box
+                    component="li"
+                    key={key}
+                    {...rest}
+                    sx={{ ...rest.sx, fontSize: "13px" }}
+                  >
+                    {option.name || option.id}
+                  </Box>
+                );
+              }}
+              ListboxProps={{ style: { maxHeight: 250 } }}
+            />
+          </Box>
+        )}
+
+        {/* Voice indicator — voice projects always map to voice calls, so
+            the row-type tabs are replaced by a static chip that mirrors the
+            "Voice Calls" label shown in the task flow's live preview. */}
+        {!rowTypeLocked && !!selectedProjectId && isVoiceProject && (
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+            <Typography variant="body2" fontWeight={600}>
+              Row Type
+            </Typography>
+            <Chip
+              label="Voice Calls"
+              size="small"
+              sx={{
+                height: 20,
+                fontSize: "11px",
+                bgcolor: "background.neutral",
+                color: "text.secondary",
+                "& .MuiChip-label": { px: 0.75 },
+                "& .MuiChip-icon": { ml: 0.5, mr: -0.25 },
+              }}
+            />
+          </Box>
+        )}
+
+        {/* Row type toggle — hidden when:
+            - row type is pre-set by parent (task flow)
+            - no project selected yet (nothing to type against)
+            - selected project is a voice/simulator project (always
+              VoiceCall, row type isn't meaningful) */}
+        {!rowTypeLocked && !!selectedProjectId && !isVoiceProject && (
+          <Box>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ fontSize: "11px", display: "block", mb: 0.75 }}
+            >
+              Run evaluations on
+            </Typography>
+            <Tabs
+              value={rowType}
+              onChange={(_, val) => {
+                setRowType(val);
+                setMapping({});
+              }}
+              variant="standard"
+              scrollButtons={false}
+              TabIndicatorProps={{ style: { display: "none" } }}
+              sx={{
+                minHeight: 28,
+                "& .MuiTabs-scroller": { overflow: "visible !important" },
+                "& .MuiTab-root": {
+                  minHeight: 28,
+                  px: 1.25,
+                  py: 0,
+                  mr: "0px !important",
+                  textTransform: "none",
+                  fontSize: "12px",
+                  borderRadius: "6px",
+                  minWidth: "auto",
+                },
+                border: "1px solid",
+                borderColor: "divider",
+                p: "2px",
+                borderRadius: "8px",
+                width: "fit-content",
+                bgcolor: (theme) =>
+                  theme.palette.mode === "dark"
+                    ? "rgba(255,255,255,0.04)"
+                    : "background.neutral",
+              }}
+            >
+              {ROW_TYPE_OPTIONS.map((t) => (
+                <Tab
+                  key={t.value}
+                  value={t.value}
+                  label={
+                    <Box
+                      sx={{ display: "flex", alignItems: "center", gap: 0.5 }}
+                    >
+                      <Iconify icon={t.icon} width={13} />
+                      {t.label}
+                    </Box>
+                  }
+                  sx={{
+                    bgcolor:
+                      rowType === t.value
+                        ? (theme) =>
+                            theme.palette.mode === "dark"
+                              ? "rgba(255,255,255,0.12)"
+                              : "background.paper"
+                        : "transparent",
+                    boxShadow:
+                      rowType === t.value
+                        ? (theme) =>
+                            theme.palette.mode === "dark"
+                              ? "none"
+                              : "0 1px 3px rgba(0,0,0,0.08)"
+                        : "none",
+                    borderRadius: "6px",
+                    fontWeight: rowType === t.value ? 600 : 400,
+                    color:
+                      rowType === t.value ? "text.primary" : "text.disabled",
+                  }}
+                />
+              ))}
+            </Tabs>
+          </Box>
+        )}
+
+        {hostsFilter && !!selectedProjectId && (
+          <Box>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ fontSize: "11px", display: "block", mb: 0.75 }}
+            >
+              Narrow down which{" "}
+              {rowType === "Trace"
+                ? "traces"
+                : rowType === "Session"
+                  ? "sessions"
+                  : rowType === "VoiceCall"
+                    ? "voice calls"
+                    : "spans"}{" "}
+              to preview
+            </Typography>
+            <TaskFilterBar
+              control={internalFilterForm.control}
+              setValue={internalFilterForm.setValue}
+              projectId={selectedProjectId}
+              isSimulator={isVoiceProject}
+              rowType={rowType}
+            />
+          </Box>
+        )}
+
+        {/* Loading */}
+        {(loading || isPendingNewFetch) && (
+          <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
+            <CircularProgress size={20} />
+          </Box>
+        )}
+
+        {/* Row navigator */}
+        {selectedProjectId &&
+          (rows?.length ?? 0) > 0 &&
+          !loading &&
+          !isPendingNewFetch && (
+            <Box
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 1,
+              }}
+            >
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ fontSize: "11px" }}
+              >
+                Row {Math.min(currentRowIndex + 1, rows?.length ?? 0)} of{" "}
+                {rows?.length ?? 0}
+                {(totalRows ?? 0) > (rows?.length ?? 0) && (
+                  <Typography
+                    component="span"
+                    sx={{
+                      fontSize: "11px",
+                      color: "text.disabled",
+                      ml: 0.5,
+                    }}
+                  >
+                    ({totalRows} matching total)
+                  </Typography>
+                )}
+              </Typography>
+              <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                <IconButton
+                  size="small"
+                  disabled={currentRowIndex === 0}
+                  onClick={() => {
+                    setCurrentRowIndex((i) => Math.max(0, i - 1));
+                    setResult(null);
+                    setError(null);
+                    onClearResult?.();
+                  }}
+                  sx={{ width: 24, height: 24 }}
+                >
+                  <Iconify icon="mdi:chevron-left" width={16} />
+                </IconButton>
+                <IconButton
+                  size="small"
+                  disabled={currentRowIndex >= (rows?.length ?? 0) - 1}
+                  onClick={() => {
+                    setCurrentRowIndex((i) =>
+                      Math.min((rows?.length ?? 0) - 1, i + 1),
+                    );
+                    setResult(null);
+                    setError(null);
+                    onClearResult?.();
+                  }}
+                  sx={{ width: 24, height: 24 }}
+                >
+                  <Iconify icon="mdi:chevron-right" width={16} />
+                </IconButton>
+              </Box>
+            </Box>
+          )}
+
+        {/* Span/Trace detail — table format like DatasetTestMode */}
+        {loadingDetail && (
+          <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
+            <CircularProgress size={18} />
+          </Box>
+        )}
+
+        {spanDetail && !loadingDetail && (
+          <Box
+            sx={{
+              border: "1px solid",
+              borderColor: "divider",
+              borderRadius: "6px",
+              overflow: "hidden",
+            }}
+          >
+            {/* Search */}
+            <Box
+              sx={{
+                px: 1,
+                py: 0.75,
+                borderBottom: "1px solid",
+                borderColor: "divider",
+              }}
+            >
+              <TextField
+                size="small"
+                fullWidth
+                placeholder="Search columns or values..."
+                value={tableSearch}
+                onChange={(e) => setTableSearch(e.target.value)}
+                InputProps={{
+                  startAdornment: (
+                    <InputAdornment position="start">
+                      <Iconify
+                        icon="mdi:magnify"
+                        width={14}
+                        sx={{ color: "text.disabled" }}
+                      />
+                    </InputAdornment>
+                  ),
+                  sx: { fontSize: "12px", height: 28 },
+                }}
+              />
+            </Box>
+
+            {/* Header */}
+            <Box
+              sx={{
+                display: "flex",
+                px: 1.5,
+                py: 0.5,
+                backgroundColor: (theme) =>
+                  theme.palette.mode === "dark"
+                    ? "rgba(255,255,255,0.03)"
+                    : "background.default",
+                borderBottom: "1px solid",
+                borderColor: "divider",
+              }}
+            >
+              <Typography
+                variant="caption"
+                fontWeight={600}
+                sx={{ width: 130, flexShrink: 0 }}
+              >
+                Columns
+              </Typography>
+              <Typography variant="caption" fontWeight={600} sx={{ flex: 1 }}>
+                Value
+              </Typography>
+            </Box>
+
+            {/* Rows — iterate span detail keys, flatten span_attributes */}
+            <Box sx={{ maxHeight: 400, overflowY: "auto" }}>
+              {(() => {
+                // canonicalEntries skips the camelCase aliases the axios
+                // interceptor adds — otherwise every field shows up twice
+                // in the span detail table.
+                const raw = canonicalEntries(spanDetail).filter(
+                  ([key]) => key !== "spans",
+                );
+                const spanAttrs = spanDetail?.span_attributes;
+                if (
+                  !spanAttrs ||
+                  typeof spanAttrs !== "object" ||
+                  Array.isArray(spanAttrs)
+                ) {
+                  return sortEntries(raw);
+                }
+                const topKeys = new Set(raw.map(([k]) => k));
+                const flattened = raw.filter(([k]) => k !== "span_attributes");
+                for (const [k, v] of canonicalEntries(spanAttrs)) {
+                  if (!topKeys.has(k)) {
+                    flattened.push([k, v]);
+                  }
+                }
+                return sortEntries(flattened);
+              })()
+                .filter(([key, val]) => {
+                  if (!tableSearch.trim()) return true;
+                  const q = tableSearch.toLowerCase();
+                  return key.toLowerCase().includes(q) || deepMatch(val, q);
+                })
+                .map(([key, val]) => {
+                  const isObj =
+                    val !== null &&
+                    val !== undefined &&
+                    typeof val === "object" &&
+                    !Array.isArray(val);
+                  const isArr = Array.isArray(val);
+                  const isEmpty =
+                    val === null ||
+                    val === undefined ||
+                    val === "" ||
+                    (isObj && Object.keys(val).length === 0) ||
+                    (isArr && val.length === 0);
+
+                  // Audio detection — voice calls surface recording URLs
+                  // as direct fields (recording_url, stereo_recording_url,
+                  // audio_url …) and a nested `recording` object with
+                  // per-track URLs. Render playable audio inline.
+                  const isRecordingObject = isObj && isRecordingObjectKey(key);
+                  const recordingTracks = isRecordingObject
+                    ? collectRecordingTracks(val)
+                    : [];
+                  const isPlayableString =
+                    typeof val === "string" &&
+                    (isAudioKey(key) || isAudioUrlString(val));
+                  return (
+                    <Box
+                      key={key}
+                      sx={{
+                        display: "flex",
+                        alignItems: "flex-start",
+                        px: 1.5,
+                        py: 0.6,
+                        borderBottom: "1px solid",
+                        borderColor: "divider",
+                        "&:last-child": { borderBottom: "none" },
+                        "&:hover": { backgroundColor: "action.hover" },
+                      }}
+                    >
+                      <CustomTooltip
+                        show
+                        title={key}
+                        placement="top-start"
+                        enterDelay={300}
+                        arrow
+                        size="small"
+                      >
+                        <Typography
+                          variant="caption"
+                          fontWeight={500}
+                          noWrap
+                          sx={{
+                            width: keyColWidth,
+                            flexShrink: 0,
+                            pt: 0.25,
+                          }}
+                        >
+                          {key}
+                        </Typography>
+                      </CustomTooltip>
+                      <DraggableColResizer
+                        getCurrentWidth={() => keyColWidthRef.current}
+                        onResize={setKeyColWidth}
+                        minWidth={80}
+                        maxWidth={600}
+                      />
+                      <Box sx={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+                        {isEmpty ? (
+                          <Typography variant="caption" color="text.disabled">
+                            —
+                          </Typography>
+                        ) : isPlayableString ? (
+                          <InlineAudio src={val} />
+                        ) : isRecordingObject && recordingTracks.length > 0 ? (
+                          <RecordingGroup tracks={recordingTracks} />
+                        ) : isObj || isArr ? (
+                          <JsonValueTree
+                            value={val}
+                            expanded={expandedCols[key]}
+                            onToggle={() =>
+                              setExpandedCols((prev) => ({
+                                ...prev,
+                                [key]: !prev[key],
+                              }))
+                            }
+                          />
+                        ) : (
+                          <Tooltip
+                            title={
+                              <Box
+                                component="span"
+                                sx={{
+                                  display: "block",
+                                  whiteSpace: "pre-wrap",
+                                  wordBreak: "break-all",
+                                  fontFamily: "monospace",
+                                  fontSize: 11,
+                                  maxWidth: 520,
+                                }}
+                              >
+                                {formatTooltipValue(val)}
+                              </Box>
+                            }
+                            placement="top-start"
+                            enterDelay={300}
+                            arrow
+                          >
+                            <Typography
+                              variant="caption"
+                              color="primary.main"
+                              sx={{
+                                fontSize: "12px",
+                                wordBreak: "break-all",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                display: "-webkit-box",
+                                WebkitLineClamp: expandedCols[key] ? 999 : 2,
+                                WebkitBoxOrient: "vertical",
+                                cursor: "pointer",
+                              }}
+                              onClick={() =>
+                                setExpandedCols((prev) => ({
+                                  ...prev,
+                                  [key]: !prev[key],
+                                }))
+                              }
+                            >
+                              {/* Defensive: this branch should only be
+                                  reached for primitives (the upstream
+                                  isObj/isArr check routes objects to
+                                  JsonValueTree). If something slips
+                                  through, JSON.stringify rather than
+                                  falling back to "[object Object]". */}
+                              {typeof val === "boolean"
+                                ? String(val)
+                                : typeof val === "string"
+                                  ? `"${val}"`
+                                  : val !== null && typeof val === "object"
+                                    ? JSON.stringify(val)
+                                    : String(val)}
+                            </Typography>
+                          </Tooltip>
+                        )}
+                      </Box>
+                    </Box>
+                  );
+                })}
+
+              {/* Spans section — shared renderer with TaskLivePreview. */}
+              <SpanRowList
+                spans={spanDetail.spans}
+                expandedCols={expandedCols}
+                setExpandedCols={setExpandedCols}
+                tableSearch={tableSearch}
+              />
+            </Box>
+          </Box>
+        )}
+
+        {/* Empty state */}
+        {selectedProjectId &&
+          !loading &&
+          !isPendingNewFetch &&
+          totalRows === 0 && (
+          <Box
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 0.75,
+              py: 3,
+              border: "1px dashed",
+              borderColor: "divider",
+              borderRadius: "8px",
+            }}
+          >
+            <Iconify
+              icon="mdi:table-off"
+              width={28}
+              sx={{ color: "text.disabled" }}
+            />
+            <Typography variant="body2" fontWeight={600} color="text.secondary">
+              No {rowType.toLowerCase()} data found
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              Add {rowType.toLowerCase()} to this project before running a test
+            </Typography>
+          </Box>
+        )}
+
+        {/* Variable mapping */}
+        {variables.length > 0 &&
+          (() => {
+            const isFetchingColumns =
+              !!selectedProjectId &&
+              (loading || isPendingNewFetch || loadingDetail);
+            const mappingDisabledTooltip = isFetchingColumns
+              ? "Columns are being fetched"
+              : "";
+            return (
+              <Box>
+                <Typography
+                  variant="caption"
+                  fontWeight={600}
+                  sx={{ mb: 0.5, display: "block" }}
+                >
+                  Variable Mapping
+                </Typography>
+                <Box
+                  sx={{ display: "flex", flexDirection: "column", gap: 0.75 }}
+                >
+                  {variables.map((variable) => {
+                    const autocomplete = (
+                      <Autocomplete
+                        size="small"
+                        freeSolo={allowCustomFieldPath}
+                        disabled={isFetchingColumns}
+                        options={
+                          mapping[variable] &&
+                          !fieldNames.includes(mapping[variable])
+                            ? [mapping[variable], ...fieldNames]
+                            : fieldNames
+                        }
+                        value={mapping[variable] || null}
+                        onChange={(_, val) =>
+                          setMapping((prev) => ({
+                            ...prev,
+                            [variable]: val || "",
+                          }))
+                        }
+                        {...(allowCustomFieldPath
+                          ? {
+                              inputValue: mapping[variable] || "",
+                              onInputChange: (_, val, reason) => {
+                                if (reason === "reset") return;
+                                setMapping((prev) => ({
+                                  ...prev,
+                                  [variable]: val || "",
+                                }));
+                              },
+                            }
+                          : {})}
+                        openOnFocus
+                        autoHighlight
+                        selectOnFocus
+                        handleHomeEndKeys
+                        isOptionEqualToValue={(opt, val) => opt === val}
+                        sx={{ flex: 1 }}
+                        ListboxProps={{ style: { maxHeight: 260 } }}
+                        renderInput={(params) => (
+                          <TextField
+                            {...params}
+                            placeholder={
+                              isFetchingColumns
+                                ? "Loading columns..."
+                                : allowCustomFieldPath
+                                  ? "Search or type a path (e.g. attributes.input.value)"
+                                  : "Search column..."
+                            }
+                            InputProps={{
+                              ...params.InputProps,
+                              sx: {
+                                ...params.InputProps.sx,
+                                fontSize: "12px",
+                                fontFamily: "monospace",
+                                height: 28,
+                                py: 0,
+                              },
+                              endAdornment: isFetchingColumns ? (
+                                <InputAdornment position="end">
+                                  <CircularProgress size={14} />
+                                </InputAdornment>
+                              ) : (
+                                params.InputProps.endAdornment
+                              ),
+                            }}
+                          />
+                        )}
+                        renderOption={(props, col) => {
+                          const { key, ...rest } = props;
+                          return (
+                            <Box
+                              component="li"
+                              key={key}
+                              {...rest}
+                              title={col}
+                              sx={{
+                                ...rest.sx,
+                                fontSize: "12px",
+                                fontFamily: "monospace",
+                                pl: col.includes(".")
+                                  ? `${12 + (col.split(".").length - 1) * 12}px`
+                                  : undefined,
+                                color: col.includes(".")
+                                  ? "primary.main"
+                                  : "text.primary",
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {col}
+                            </Box>
+                          );
+                        }}
+                      />
+                    );
+                    return (
+                      <Box
+                        key={variable}
+                        sx={{ display: "flex", alignItems: "center", gap: 1 }}
+                      >
+                        <Box
+                          sx={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 0.5,
+                            px: 1,
+                            py: 0.25,
+                            borderRadius: "4px",
+                            border: "1px solid",
+                            borderColor: "divider",
+                            minWidth: 120,
+                          }}
+                        >
+                          <Iconify
+                            icon="mdi:code-braces"
+                            width={14}
+                            sx={{ color: "text.secondary" }}
+                          />
+                          <Typography
+                            variant="caption"
+                            fontWeight={600}
+                            sx={{ fontSize: "12px" }}
+                          >
+                            {variable}
+                          </Typography>
+                        </Box>
+                        <Iconify
+                          icon="mdi:arrow-right"
+                          width={14}
+                          sx={{ color: "text.disabled" }}
+                        />
+                        {isFetchingColumns ? (
+                          <CustomTooltip
+                            show
+                            type="black"
+                            size="small"
+                            title={mappingDisabledTooltip}
+                            placement="top"
+                            arrow
+                          >
+                            <Box sx={{ flex: 1 }}>{autocomplete}</Box>
+                          </CustomTooltip>
+                        ) : (
+                          autocomplete
+                        )}
+                      </Box>
+                    );
+                  })}
+                </Box>
+              </Box>
+            );
+          })()}
+
+        {/* Result */}
+        {result && (
+          <EvalResultDisplay
+            result={{
+              ...result,
+              ...(errorLocalizerState.status
+                ? { error_localizer_status: errorLocalizerState.status }
+                : {}),
+              ...(errorLocalizerState.details
+                ? {
+                    error_details:
+                      errorLocalizerState.details.error_analysis ||
+                      errorLocalizerState.details,
+                    selected_input_key:
+                      errorLocalizerState.details.selected_input_key,
+                    input_data: errorLocalizerState.details.input_data,
+                    input_types: errorLocalizerState.details.input_types,
+                  }
+                : {}),
+            }}
+          />
+        )}
+
+        {error && (
+          <Box
+            sx={(t) => ({
+              p: 1.5,
+              borderRadius: "6px",
+              border: "1px solid",
+              borderColor: alpha(t.palette.error.main, 0.4),
+              backgroundColor: alpha(
+                t.palette.error.main,
+                t.palette.mode === "dark" ? 0.16 : 0.08,
+              ),
+            })}
+          >
+            <Typography variant="caption" color="error.main">
+              {typeof error === "string" ? error : JSON.stringify(error)}
+            </Typography>
+          </Box>
+        )}
+      </Box>
+    );
+  },
+);
+
+TracingTestMode.displayName = "TracingTestMode";
+
+TracingTestMode.propTypes = {
+  templateId: PropTypes.string,
+  variables: PropTypes.array,
+  codeParams: PropTypes.object,
+  onTestResult: PropTypes.func,
+  onColumnsLoaded: PropTypes.func,
+  onClearResult: PropTypes.func,
+  onReadyChange: PropTypes.func,
+  hasDataInjection: PropTypes.bool,
+  initialProjectId: PropTypes.string,
+  initialRowType: PropTypes.string,
+  initialMapping: PropTypes.object,
+  isComposite: PropTypes.bool,
+  compositeAdhocConfig: PropTypes.object,
+  localFilters: PropTypes.array,
+  allowCustomFieldPath: PropTypes.bool,
+};
+
+export default TracingTestMode;
